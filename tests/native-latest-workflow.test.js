@@ -115,9 +115,21 @@ test("native latest candidate workflow opens a handoff PR for failed candidates"
   assert.match(workflow, /scripts\/prepare-native-failure-handoff\.js[\s\S]*--candidate/);
   assert.match(workflow, /docs\/native-latest-failures\/\$\{VERSION\}\.md/);
   assert.match(workflow, /Create native candidate failure handoff PR/);
+  assert.match(workflow, /id:\s*failure_handoff_pr/);
   assert.match(workflow, /peter-evans\/create-pull-request@v\d+/);
   assert.match(workflow, /codex\/native-latest-\$\{\{\s*steps\.version\.outputs\.version\s*\}\}-fix/);
   assert.match(workflow, /draft:\s*true/);
   assert.match(workflow, /follow up macOS native \$\{\{\s*steps\.version\.outputs\.version\s*\}\} candidate failure/);
   assert.match(workflow, /steps\.failure_handoff\.outputs\.report_path != ''/);
+});
+
+test("native latest candidate workflow summarizes the failure handoff PR result", () => {
+  const workflow = readWorkflow();
+
+  assert.match(workflow, /Summarize native failure handoff PR/);
+  assert.match(workflow, /steps\.failure_handoff_pr\.outputs\.pull-request-url/);
+  assert.match(workflow, /steps\.failure_handoff_pr\.outputs\.pull-request-branch/);
+  assert.match(workflow, /steps\.failure_handoff_pr\.outputs\.pull-request-operation/);
+  assert.match(workflow, /codex\/native-latest-\$\{\{\s*steps\.version\.outputs\.version\s*\}\}-fix/);
+  assert.match(workflow, /GITHUB_STEP_SUMMARY/);
 });

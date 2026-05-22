@@ -143,6 +143,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create native candidate failure handoff PR
+        id: failure_handoff_pr
         if: failure() && steps.failure_handoff.outputs.report_path != ''
         uses: peter-evans/create-pull-request@v8
         with:
@@ -162,6 +163,30 @@ jobs:
             Candidate JSON artifact: `native-latest-candidate-${{ steps.version.outputs.version }}`.
 
             Text diff report artifact: `native-latest-text-diff-${{ steps.version.outputs.version }}`.
+
+      - name: Summarize native failure handoff PR
+        if: failure() && steps.failure_handoff.outputs.report_path != ''
+        shell: bash
+        run: |
+          PR_URL="${{ steps.failure_handoff_pr.outputs.pull-request-url }}"
+          PR_BRANCH="${{ steps.failure_handoff_pr.outputs.pull-request-branch }}"
+          PR_OPERATION="${{ steps.failure_handoff_pr.outputs.pull-request-operation }}"
+          if [ -z "$PR_BRANCH" ]; then
+            PR_BRANCH="codex/native-latest-${{ steps.version.outputs.version }}-fix"
+          fi
+          {
+            echo "## Native failure handoff PR"
+            echo "- Branch: \`${PR_BRANCH}\`"
+            if [ -n "$PR_URL" ]; then
+              echo "- Pull request: ${PR_URL}"
+            else
+              echo "- Pull request: not created; inspect the create-pull-request step logs."
+            fi
+            if [ -n "$PR_OPERATION" ]; then
+              echo "- Operation: \`${PR_OPERATION}\`"
+            fi
+            echo "- Report: \`${{ steps.failure_handoff.outputs.report_path }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Promote native candidate support surfaces
         if: success()
