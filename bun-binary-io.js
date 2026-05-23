@@ -114,9 +114,9 @@ function detectInstallation(claudeCmd) {
   try { realPath = fs.realpathSync(claudeCmd); } catch { return "unknown"; }
 
   // 2. 先判真实目标本身是不是 Bun 二进制（Codex 二审 #1）
-  //    仅支持 Mach-O（macOS），ELF (Linux) 暂不开放
+  //    支持 Mach-O (macOS)、ELF (Linux)、PE (Windows)
   const format = detectBinaryFormat(realPath);
-  if ((format === "MachO64" || format === "MachO32" || format === "PE") && hasBunTrailer(realPath)) {
+  if ((format === "MachO64" || format === "MachO32" || format === "PE" || format === "ELF") && hasBunTrailer(realPath)) {
     return "native-bun:" + realPath;
   }
 
@@ -134,7 +134,7 @@ function detectInstallation(claudeCmd) {
     "node_modules/@anthropic-ai/claude-code/bin/claude.exe");
   if (fs.existsSync(npmExe)) {
     const exeFormat = detectBinaryFormat(npmExe);
-    if ((exeFormat === "PE" || exeFormat === "MachO64" || exeFormat === "MachO32") && hasBunTrailer(npmExe)) {
+    if ((exeFormat === "PE" || exeFormat === "MachO64" || exeFormat === "MachO32" || exeFormat === "ELF") && hasBunTrailer(npmExe)) {
       return "native-bun:" + npmExe;
     }
   }
@@ -149,7 +149,7 @@ function detectInstallation(claudeCmd) {
     const npmExe2 = path.join(globalRoot, "@anthropic-ai/claude-code/bin/claude.exe");
     if (fs.existsSync(npmExe2)) {
       const exeFormat2 = detectBinaryFormat(npmExe2);
-      if ((exeFormat2 === "PE" || exeFormat2 === "MachO64" || exeFormat2 === "MachO32") && hasBunTrailer(npmExe2)) {
+      if ((exeFormat2 === "PE" || exeFormat2 === "MachO64" || exeFormat2 === "MachO32" || exeFormat2 === "ELF") && hasBunTrailer(npmExe2)) {
         return "native-bun:" + npmExe2;
       }
     }
@@ -276,19 +276,30 @@ function extractBunDataFromSection(sectionData) {
 }
 
 // ============================================================================
-// 使用 node-lief 的提取/重打包
+// 使用 node-lief 的提取/重打包（统一支持 Mach-O + ELF）
 // ============================================================================
 
-function extractFromMachO(LIEF, binaryPath) {
+function extractBunData(LIEF, binaryPath) {
   LIEF.logging.disable();
   const binary = LIEF.parse(binaryPath);
+  const format = binary.format;
 
-  const bunSegment = binary.getSegment("__BUN");
-  if (!bunSegment) throw new Error("__BUN segment not found");
-  const bunSection = bunSegment.getSection("__bun");
-  if (!bunSection) throw new Error("__bun section not found");
+  let sectionContent;
+  if (format === "ELF") {
+    const bunSection = binary.getSection(".bun");
+    if (!bunSection) throw new Error(".bun section not found in ELF binary");
+    sectionContent = Buffer.from(bunSection.content);
+  } else if (format === "MachO" || format === "PE") {
+    const bunSegment = binary.getSegment("__BUN");
+    if (!bunSegment) throw new Error("__BUN segment not found");
+    const bunSection = bunSegment.getSection("__bun");
+    if (!bunSection) throw new Error("__bun section not found");
+    sectionContent = Buffer.from(bunSection.content);
+  } else {
+    throw new Error("Unsupported binary format: " + format);
+  }
 
-  return extractBunDataFromSection(bunSection.content);
+  return extractBunDataFromSection(sectionContent);
 }
 
 function findClaudeModule(bunData, bunOffsets, moduleStructSize) {
@@ -466,35 +477,63 @@ function signAndVerifyMachO(outputPath) {
   runCodesign(["--verify", "--strict", "--verbose=4", outputPath], "verify");
 }
 
-function repackMachO(LIEF, machoBinary, binPath, newBunBuffer, outputPath, sectionHeaderSize) {
-  // 移除旧签名
-  if (machoBinary.hasCodeSignature) {
-    machoBinary.removeSignature();
-  }
-
-  const bunSegment = machoBinary.getSegment("__BUN");
-  if (!bunSegment) throw new Error("__BUN segment not found");
-  const bunSection = bunSegment.getSection("__bun");
-  if (!bunSection) throw new Error("__bun section not found");
-
+function repackBinary(LIEF, binary, binPath, newBunBuffer, outputPath, sectionHeaderSize) {
+  const format = binary.format;
   const newSectionData = buildSectionData(newBunBuffer, sectionHeaderSize);
-  const sizeDiff = newSectionData.length - Number(bunSection.size);
 
-  if (sizeDiff > 0) {
-    const isARM64 = machoBinary.header.cpuType === LIEF.MachO.Header.CPU_TYPE.ARM64;
-    const PAGE_SIZE = isARM64 ? 16384 : 4096;
-    const alignedSizeDiff = Math.ceil(sizeDiff / PAGE_SIZE) * PAGE_SIZE;
-    const success = machoBinary.extendSegment(bunSegment, alignedSizeDiff);
-    if (!success) throw new Error("Failed to extend __BUN segment");
+  if (format === "ELF") {
+    // ELF: 直接替换 .bun section 内容
+    const bunSection = binary.getSection(".bun");
+    if (!bunSection) throw new Error(".bun section not found in ELF binary");
+
+    const sizeDiff = newSectionData.length - Number(bunSection.size);
+    if (sizeDiff > 0) {
+      // 检查是否在所在 LOAD segment 范围内
+      let fits = false;
+      for (const seg of binary.segments()) {
+        if (seg.type && seg.type.toString().includes("LOAD")) {
+          const segEnd = Number(seg.fileOffset) + Number(seg.fileSize);
+          const secEnd = Number(bunSection.offset) + newSectionData.length;
+          if (Number(bunSection.offset) >= Number(seg.fileOffset) && Number(bunSection.offset) < segEnd) {
+            if (secEnd > segEnd) throw new Error("New .bun section exceeds LOAD segment boundary");
+            fits = true;
+            break;
+          }
+        }
+      }
+      if (!fits) throw new Error(".bun section not found in any LOAD segment");
+    }
+
+    bunSection.content = newSectionData;
+    atomicWriteBinary(LIEF, binary, outputPath, binPath);
+  } else if (format === "MachO") {
+    // macOS: 替换 __BUN,__bun section，需要 codesign
+    if (binary.hasCodeSignature) {
+      binary.removeSignature();
+    }
+
+    const bunSegment = binary.getSegment("__BUN");
+    if (!bunSegment) throw new Error("__BUN segment not found");
+    const bunSection = bunSegment.getSection("__bun");
+    if (!bunSection) throw new Error("__bun section not found");
+
+    const sizeDiff = newSectionData.length - Number(bunSection.size);
+    if (sizeDiff > 0) {
+      const isARM64 = binary.header.cpuType === LIEF.MachO.Header.CPU_TYPE.ARM64;
+      const PAGE_SIZE = isARM64 ? 16384 : 4096;
+      const alignedSizeDiff = Math.ceil(sizeDiff / PAGE_SIZE) * PAGE_SIZE;
+      const success = binary.extendSegment(bunSegment, alignedSizeDiff);
+      if (!success) throw new Error("Failed to extend __BUN segment");
+    }
+
+    bunSection.content = newSectionData;
+    bunSection.size = BigInt(newSectionData.length);
+
+    atomicWriteBinary(LIEF, binary, outputPath, binPath);
+    signAndVerifyMachO(outputPath);
+  } else {
+    throw new Error("Unsupported binary format for repack: " + format);
   }
-
-  bunSection.content = newSectionData;
-  bunSection.size = BigInt(newSectionData.length);
-
-  atomicWriteBinary(LIEF, machoBinary, outputPath, binPath);
-
-  // macOS 必须重签并通过校验；否则运行时会被系统直接 kill。
-  signAndVerifyMachO(outputPath);
 }
 
 // ============================================================================
@@ -522,7 +561,7 @@ function cmdExtract() {
     process.exit(1);
   }
 
-  const { bunData, bunOffsets, moduleStructSize } = extractFromMachO(LIEF, binaryPath);
+  const { bunData, bunOffsets, moduleStructSize } = extractBunData(LIEF, binaryPath);
   const found = findClaudeModule(bunData, bunOffsets, moduleStructSize);
   if (!found || found.contents.length === 0) {
     process.stderr.write("Error: claude module not found in binary\n");
@@ -551,15 +590,10 @@ function cmdRepack() {
   const modifiedJs = fs.readFileSync(jsPath);
   const binary = LIEF.parse(binaryPath);
 
-  const { bunOffsets, bunData, sectionHeaderSize, moduleStructSize } = extractFromMachO(LIEF, binaryPath);
+  const { bunOffsets, bunData, sectionHeaderSize, moduleStructSize } = extractBunData(LIEF, binaryPath);
   const newBuffer = rebuildBunData(bunData, bunOffsets, modifiedJs, moduleStructSize);
 
-  if (binary.format !== "MachO") {
-    process.stderr.write("Error: only Mach-O (macOS) is supported in this version\n");
-    process.exit(1);
-  }
-
-  repackMachO(LIEF, binary, binaryPath, newBuffer, binaryPath, sectionHeaderSize);
+  repackBinary(LIEF, binary, binaryPath, newBuffer, binaryPath, sectionHeaderSize);
   process.stdout.write("ok");
 }
 
@@ -577,10 +611,9 @@ function cmdVersion() {
   }
 
   try {
-    const { bunData, bunOffsets, moduleStructSize } = extractFromMachO(LIEF, binaryPath);
+    const { bunData, bunOffsets, moduleStructSize } = extractBunData(LIEF, binaryPath);
     const found = findClaudeModule(bunData, bunOffsets, moduleStructSize);
     if (found && found.contents.length > 0) {
-      // 从 JS 内容头部提取版本号（匹配 "// Version: X.Y.Z" 格式）
       const header = found.contents.subarray(0, 200).toString("utf-8");
       const match = header.match(/\/\/ Version: (\S+)/);
       if (match) {

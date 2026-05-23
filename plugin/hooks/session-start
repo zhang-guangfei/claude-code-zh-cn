@@ -113,7 +113,8 @@ const version = process.argv[3];
 const data = JSON.parse(fs.readFileSync(file, "utf8"));
 const versions = [
   ...(data.macosNativeOfficialInstallerExperimental?.versions || []),
-  ...(data.macosNativeExperimental?.versions || []),
+  ...(data.macosNativeExperimental?.versions || [])
+  ...(data.linuxNativeExperimental?.versions || []),
 ];
 process.exit(versions.includes(version) ? 0 : 1);
 NODE
@@ -510,6 +511,8 @@ fi
 repair_settings_from_cache
 
 # 读取用户输入
+node "$PLUGIN_ROOT/patch-plugins.js" >/dev/null 2>&1 || true
+
 read -r INPUT
 
 # 输出中文上下文注入
