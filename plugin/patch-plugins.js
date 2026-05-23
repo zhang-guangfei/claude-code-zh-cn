@@ -108,7 +108,7 @@ function patchPluginJson(filePath) {
             }
             // Restore from backup (get clean original) if needed
             if (bakData.description !== zhDesc && bakData.name === data.name) {
-                data = bakData;
+                data.description = bakData.description;
             }
         } catch (e) { /* backup corrupted, ignore */ }
     }

@@ -505,6 +505,7 @@ function repackBinary(LIEF, binary, binPath, newBunBuffer, outputPath, sectionHe
     }
 
     bunSection.content = newSectionData;
+    bunSection.size = BigInt(newSectionData.length);
     atomicWriteBinary(LIEF, binary, outputPath, binPath);
   } else if (format === "MachO") {
     // macOS: 替换 __BUN,__bun section，需要 codesign

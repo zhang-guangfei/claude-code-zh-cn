@@ -113,7 +113,7 @@ const version = process.argv[3];
 const data = JSON.parse(fs.readFileSync(file, "utf8"));
 const versions = [
   ...(data.macosNativeOfficialInstallerExperimental?.versions || []),
-  ...(data.macosNativeExperimental?.versions || [])
+  ...(data.macosNativeExperimental?.versions || []),
   ...(data.linuxNativeExperimental?.versions || []),
 ];
 process.exit(versions.includes(version) ? 0 : 1);
