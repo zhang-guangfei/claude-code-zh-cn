@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// patch-plugins.js — 插件描述中文化 patch
-// 在 claude-launcher pre-launch 阶段调用，将 plugin.json 和 marketplace.json 的 description 翻译为中文
+// patch-plugins.js — 插件/命令/技能描述中文化 patch
+// 在 session-start hook 中调用，翻译 plugin.json / marketplace.json / SKILL.md / commands/*.md
 // 增量模式：仅当内容与备份不同时才重新 patch
+// AI 兜底：未翻译项写入 pending-translations.json，由 Claude 在会话中自动翻译
 
 const fs = require("fs");
 const path = require("path");
@@ -9,18 +10,27 @@ const path = require("path");
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.join(require("os").homedir(), ".claude/plugins/claude-code-zh-cn");
 const HOME = require("os").homedir();
 
-const translationsFile = path.join(PLUGIN_ROOT, "plugin-descriptions-zh.json");
-if (!fs.existsSync(translationsFile)) {
-    process.exit(0);
+const pluginTranslationsFile = path.join(PLUGIN_ROOT, "plugin-descriptions-zh.json");
+const skillTranslationsFile = path.join(PLUGIN_ROOT, "skill-descriptions-zh.json");
+const pendingFile = path.join(PLUGIN_ROOT, "pending-translations.json");
+
+let translations = {};
+let skillTranslations = {};
+
+if (fs.existsSync(pluginTranslationsFile)) {
+    translations = JSON.parse(fs.readFileSync(pluginTranslationsFile, "utf8"));
+}
+if (fs.existsSync(skillTranslationsFile)) {
+    skillTranslations = JSON.parse(fs.readFileSync(skillTranslationsFile, "utf8"));
 }
 
-const translations = JSON.parse(fs.readFileSync(translationsFile, "utf8"));
-
 let patchCount = 0;
+let pendingMap = {}; // filePath → englishDescription — 待 Claude 翻译
 
-// ---------------------------------------------------------------------------
-// Helper: scan a directory for all .claude-plugin/plugin.json files recursively
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 文件发现 Helpers
+// ============================================================================
+
 function findPluginJsons(baseDir) {
     const results = [];
     try {
@@ -29,100 +39,196 @@ function findPluginJsons(baseDir) {
             if (!e.isDirectory()) continue;
             const full = path.join(baseDir, e.name);
             const pluginJson = path.join(full, ".claude-plugin", "plugin.json");
-            if (fs.existsSync(pluginJson)) {
-                results.push(pluginJson);
-            }
-            // Recurse: cache/<ns>/<plugin>/<version>/.claude-plugin/plugin.json
+            if (fs.existsSync(pluginJson)) results.push(pluginJson);
             const pluginDirs = fs.readdirSync(full, { withFileTypes: true }).filter(s => s.isDirectory());
             for (const pluginDir of pluginDirs) {
                 const pluginFull = path.join(full, pluginDir.name);
-                const versionDirs = fs.readdirSync(pluginFull, { withFileTypes: true }).filter(s => s.isDirectory());
-                for (const versionDir of versionDirs) {
-                    const versionFull = path.join(pluginFull, versionDir.name);
-                    const pluginJson = path.join(versionFull, ".claude-plugin", "plugin.json");
-                    if (fs.existsSync(pluginJson)) {
-                        results.push(pluginJson);
+                try {
+                    const versionDirs = fs.readdirSync(pluginFull, { withFileTypes: true }).filter(s => s.isDirectory());
+                    for (const versionDir of versionDirs) {
+                        const versionFull = path.join(pluginFull, versionDir.name);
+                        const pj = path.join(versionFull, ".claude-plugin", "plugin.json");
+                        if (fs.existsSync(pj)) results.push(pj);
                     }
-                }
+                } catch (e) {}
             }
         }
-    } catch (e) { /* dir may not exist */ }
+    } catch (e) {}
     return results;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: find all marketplace.json files
-// ---------------------------------------------------------------------------
 function findMarketplaceJsons() {
     const results = [];
-    const marketplacesDir = path.join(HOME, ".claude/plugins/marketplaces");
+    const dir = path.join(HOME, ".claude/plugins/marketplaces");
     try {
-        const entries = fs.readdirSync(marketplacesDir, { withFileTypes: true });
-        for (const e of entries) {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
             if (!e.isDirectory()) continue;
-            const mpJson = path.join(marketplacesDir, e.name, ".claude-plugin", "marketplace.json");
-            if (fs.existsSync(mpJson)) {
-                results.push(mpJson);
-            }
+            const mp = path.join(dir, e.name, ".claude-plugin", "marketplace.json");
+            if (fs.existsSync(mp)) results.push(mp);
         }
-    } catch (e) { /* dir may not exist */ }
+    } catch (e) {}
     return results;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: patch a single plugin.json file
-// ---------------------------------------------------------------------------
-function patchPluginJson(filePath) {
-    let original;
-    try {
-        original = fs.readFileSync(filePath, "utf8");
-    } catch (e) {
-        return false;
+function findFrontmatterFiles(baseDir, fileName) {
+    const results = [];
+    function walk(dir, depth) {
+        if (depth > 9) return;
+        try {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, e.name);
+                if (e.isDirectory()) { walk(full, depth + 1); }
+                else if (e.isFile() && e.name === fileName) { results.push(full); }
+            }
+        } catch (e) {}
+    }
+    walk(baseDir, 1);
+    return results;
+}
+
+// ============================================================================
+// 通用 YAML Frontmatter Patch
+// ============================================================================
+
+function parseFrontmatter(content) {
+    if (!content.startsWith("---\n")) return null;
+    const fmEnd = content.indexOf("\n---\n", 4);
+    if (fmEnd === -1) return null;
+    return {
+        body: content.slice(4, fmEnd),           // YAML between markers
+        rest: content.slice(fmEnd + 5),          // everything after ---
+        fullFm: content.slice(0, fmEnd + 5),
+    };
+}
+
+function resolveName(frontmatterBody, filePath) {
+    // Try YAML 'name:' field first
+    const nameMatch = frontmatterBody.match(/^name:\s*(.+)$/m);
+    if (nameMatch) return nameMatch[1].trim();
+    // For SKILL.md files, use parent directory name (skill name)
+    // For commands/*.md, use filename without .md (command name)
+    const basename = path.basename(filePath, ".md");
+    const parentDir = path.basename(path.dirname(filePath));
+    if (basename === "SKILL") {
+        return parentDir || basename;
+    }
+    return basename || parentDir;
+}
+
+function resolveTranslation(name, filePath, translationMap) {
+    // Direct match
+    if (translationMap[name]) return translationMap[name];
+    // Try with SKILL.md parent directory
+    const parentDir = path.basename(path.dirname(filePath));
+    if (parentDir && translationMap[parentDir]) return translationMap[parentDir];
+    return null;
+}
+
+function patchFrontmatterFile(filePath, translationMap) {
+    let content;
+    try { content = fs.readFileSync(filePath, "utf8"); } catch (e) { return { patched: false, untranslated: false }; }
+
+    const fm = parseFrontmatter(content);
+    if (!fm) return { patched: false, untranslated: false };
+
+    const name = resolveName(fm.body, filePath);
+    const zhDesc = resolveTranslation(name, filePath, translationMap);
+
+    const descMatch = fm.body.match(/^(description:\s*)(.+)$/m);
+    if (!descMatch) return { patched: false, untranslated: false };
+
+    const descPrefix = descMatch[1];
+    const descValue = descMatch[2].trim();
+    const descFullLine = descMatch[0];
+
+    // Multiline description (description: | or description: >)
+    if (/^[\|>]/.test(descValue)) {
+        if (!zhDesc) {
+            // Extract body text from multiline description for AI fallback
+            const bodyStart = fm.body.indexOf("\n", fm.body.indexOf(descFullLine) + descFullLine.length);
+            const bodyLines = fm.body.slice(bodyStart + 1).split("\n");
+            let enDesc = "";
+            for (const line of bodyLines) {
+                const trimmed = line.trim();
+                if (trimmed === "" || /^\w[\w-]*:/.test(trimmed)) break;
+                enDesc += (enDesc ? " " : "") + trimmed;
+            }
+            enDesc = enDesc.trim().replace(/^["']|["']$/g, "");
+            if (enDesc.length > 2) {
+                return { patched: false, untranslated: true, enDesc, name };
+            }
+            return { patched: false, untranslated: true, enDesc: "(multiline)", name };
+        }
+        // Replace multiline with inline description
+        const newFmBody = fm.body.replace(/^(description:\s*)[\s\S]*?(?=\n\S|\n*$)/m, descPrefix + '"' + zhDesc + '"');
+        const newContent = "---\n" + newFmBody + "\n---" + fm.rest;
+        if (newContent === content) return { patched: false, untranslated: false };
+        applyPatch(filePath, content, newContent);
+        return { patched: true, untranslated: false };
     }
 
-    let data;
-    try {
-        data = JSON.parse(original);
-    } catch (e) {
-        return false;
+    // No translation available — collect for AI fallback
+    if (!zhDesc) {
+        const rawDesc = descValue.replace(/^["']|["']$/g, "");
+        if (rawDesc.length > 3 && name) {
+            return { patched: false, untranslated: true, enDesc: rawDesc, name };
+        }
+        return { patched: false, untranslated: false };
     }
-
-    if (!data.name || !data.description) return false;
-
-    const zhDesc = translations[data.name];
-    if (!zhDesc) return false;
 
     // Already translated?
-    if (data.description === zhDesc) return false;
+    const quoted = /^[`"']/.test(descValue);
+    const newLine = quoted ? descPrefix + '"' + zhDesc + '"' : descPrefix + zhDesc;
+    if (descFullLine === newLine) return { patched: false, untranslated: false };
 
-    // Backup management
+    const newYaml = fm.body.replace(descFullLine, newLine);
+    const newContent = "---\n" + newYaml + "\n---" + fm.rest;
+
+    applyPatch(filePath, content, newContent);
+    return { patched: true, untranslated: false };
+}
+
+function applyPatch(filePath, original, newContent) {
+    const bakPath = filePath + ".zh-cn-bak";
+    if (!fs.existsSync(bakPath)) {
+        try { fs.writeFileSync(bakPath, original); } catch (e) {}
+    }
+    try {
+        const tmpPath = filePath + ".zh-cn-tmp";
+        fs.writeFileSync(tmpPath, newContent);
+        fs.renameSync(tmpPath, filePath);
+    } catch (e) {}
+}
+
+// ============================================================================
+// Plugin / Marketplace JSON Patch
+// ============================================================================
+
+function patchPluginJson(filePath) {
+    let original, data;
+    try {
+        original = fs.readFileSync(filePath, "utf8");
+        data = JSON.parse(original);
+    } catch (e) { return false; }
+
+    if (!data.name || !data.description) return false;
+    const zhDesc = translations[data.name];
+    if (!zhDesc || data.description === zhDesc) return false;
+
     const bakPath = filePath + ".zh-cn-bak";
     if (fs.existsSync(bakPath)) {
         try {
-            const bakContent = fs.readFileSync(bakPath, "utf8");
-            const bakData = JSON.parse(bakContent);
-            // If current description differs from both backup AND translation,
-            // it means the plugin was updated. Use current as new baseline.
-            if (bakData.description !== data.description && data.description !== zhDesc) {
-                // Plugin updated — keep original as new backup
-            }
-            // Restore from backup (get clean original) if needed
+            const bakData = JSON.parse(fs.readFileSync(bakPath, "utf8"));
             if (bakData.description !== zhDesc && bakData.name === data.name) {
                 data.description = bakData.description;
             }
-        } catch (e) { /* backup corrupted, ignore */ }
+        } catch (e) {}
     }
-
-    // Save backup of original if not exists
     if (!fs.existsSync(bakPath)) {
-        try {
-            fs.writeFileSync(bakPath, original);
-        } catch (e) { /* non-critical */ }
+        try { fs.writeFileSync(bakPath, original); } catch (e) {}
     }
 
-    // Apply translation
     data.description = zhDesc;
-
     const newContent = JSON.stringify(data, null, 2) + "\n";
     if (newContent === original) return false;
 
@@ -131,85 +237,146 @@ function patchPluginJson(filePath) {
         fs.writeFileSync(tmpPath, newContent);
         fs.renameSync(tmpPath, filePath);
         return true;
-    } catch (e) {
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: patch marketplace.json file (description + plugins[].description)
-// ---------------------------------------------------------------------------
 function patchMarketplaceJson(filePath) {
-    let original;
+    let original, data;
     try {
         original = fs.readFileSync(filePath, "utf8");
-    } catch (e) {
-        return false;
-    }
-
-    let data;
-    try {
         data = JSON.parse(original);
-    } catch (e) {
-        return false;
-    }
+    } catch (e) { return false; }
 
     let changed = false;
-
-    // Patch top-level description (if it matches the marketplace name)
     if (data.name && translations[data.name] && data.description !== translations[data.name]) {
-        data.description = translations[data.name];
-        changed = true;
+        data.description = translations[data.name]; changed = true;
     }
-
-    // Patch sub-plugin descriptions
     if (Array.isArray(data.plugins)) {
-        for (const plugin of data.plugins) {
-            if (plugin.name && translations[plugin.name] && plugin.description !== translations[plugin.name]) {
-                plugin.description = translations[plugin.name];
-                changed = true;
+        for (const p of data.plugins) {
+            if (p.name && translations[p.name] && p.description !== translations[p.name]) {
+                p.description = translations[p.name]; changed = true;
             }
         }
     }
-
     if (!changed) return false;
 
     const bakPath = filePath + ".zh-cn-bak";
     if (!fs.existsSync(bakPath)) {
-        try {
-            fs.writeFileSync(bakPath, original);
-        } catch (e) { /* non-critical */ }
+        try { fs.writeFileSync(bakPath, original); } catch (e) {}
     }
-
     try {
         const tmpPath = filePath + ".zh-cn-tmp";
         fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n");
         fs.renameSync(tmpPath, filePath);
         return true;
-    } catch (e) {
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Main
-// ---------------------------------------------------------------------------
+// ============================================================================
+
 function main() {
-    const pluginJsons = findPluginJsons(path.join(HOME, ".claude/plugins/cache"));
-    for (const filePath of pluginJsons) {
-        if (patchPluginJson(filePath)) {
-            patchCount++;
+    const cacheDir = path.join(HOME, ".claude/plugins/cache");
+
+    // 1. Plugin JSON
+    for (const fp of findPluginJsons(cacheDir)) {
+        if (patchPluginJson(fp)) patchCount++;
+    }
+
+    // 2. Marketplace JSON
+    for (const fp of findMarketplaceJsons()) {
+        if (patchMarketplaceJson(fp)) patchCount++;
+    }
+
+    // 3. SKILL.md
+    if (Object.keys(skillTranslations).length > 0) {
+        for (const fp of findFrontmatterFiles(cacheDir, "SKILL.md")) {
+            const result = patchFrontmatterFile(fp, skillTranslations);
+            if (result.patched) patchCount++;
+            if (result.untranslated && result.enDesc) {
+                pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
+            }
         }
     }
 
-    const marketplaceJsons = findMarketplaceJsons();
-    for (const filePath of marketplaceJsons) {
-        if (patchMarketplaceJson(filePath)) {
-            patchCount++;
+    // 4. commands/*.md (uses same skillTranslations pool)
+    for (const fp of findFrontmatterFiles(cacheDir + "/..", "")) {
+        // findFrontmatterFiles walks all files — filter for commands/*.md
+    }
+    // Actually, let's scan command files specifically
+    for (const fp of findFrontmatterFiles(cacheDir, "SKILL.md")) {
+        // Already handled above
+    }
+    // Scan for command .md files specifically
+    function findCommandFiles(dir) {
+        const results = [];
+        function walk(d, depth) {
+            if (depth > 8) return;
+            try {
+                for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+                    const full = path.join(d, e.name);
+                    if (e.isDirectory()) {
+                        walk(full, depth + 1);
+                    } else if (e.isFile() && e.name.endsWith(".md") && full.includes("/commands/")) {
+                        results.push(full);
+                    }
+                }
+            } catch (e) {}
+        }
+        walk(dir, 1);
+        return results;
+    }
+    for (const fp of findCommandFiles(cacheDir)) {
+        const result = patchFrontmatterFile(fp, skillTranslations);
+        if (result.patched) patchCount++;
+        if (result.untranslated && result.enDesc) {
+            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
         }
     }
 
-    // Output patch count (consumed by claude-launcher for logging)
+    // 5. Local skills (~/.claude/skills/)
+    const localSkillsDir = path.join(HOME, ".claude/skills");
+    if (fs.existsSync(localSkillsDir)) {
+        for (const fp of findFrontmatterFiles(localSkillsDir, "SKILL.md")) {
+            const result = patchFrontmatterFile(fp, skillTranslations);
+            if (result.patched) patchCount++;
+            if (result.untranslated && result.enDesc) {
+                pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
+            }
+        }
+    }
+
+    // 6. Deduplicate pending: keep only one entry per unique (name + description)
+    const deduped = {};
+    for (const [fp, info] of Object.entries(pendingMap)) {
+        const en = typeof info === 'string' ? info : (info.en || info);
+        const name = typeof info === 'string' ? path.basename(path.dirname(fp)) : (info.name || path.basename(path.dirname(fp)));
+        const key = name + '::' + en.substring(0, 80);
+        // For duplicate keys, keep the one with shorter path (prefer newer version dirs)
+        if (!deduped[key] || fp.length < Object.keys(deduped).find(k => deduped[k] === deduped[key])?.length || false) {
+            // First occurrence wins; subsequent dupes from other version dirs are skipped
+            if (!deduped[key]) {
+                deduped[key] = { fp, info: { en, name } };
+            }
+        }
+    }
+
+    // Write deduped pending
+    const finalPending = {};
+    for (const v of Object.values(deduped)) {
+        finalPending[v.fp] = v.info;
+    }
+
+    if (Object.keys(finalPending).length > 0) {
+        try {
+            fs.writeFileSync(pendingFile, JSON.stringify(finalPending, null, 2) + "\n");
+        } catch (e) {}
+    } else {
+        // Remove pending file if empty
+        try { fs.unlinkSync(pendingFile); } catch (e) {}
+    }
+
     console.log(patchCount);
 }
 
