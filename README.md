@@ -220,14 +220,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
 | 输出风格 | - | Chinese Output Style |
 | UI 文字中文化 | 1696 条翻译，`2.1.112` 实测 1527 处有效 patch；macOS native experimental `2.1.113 - 2.1.114`、`2.1.116 - 2.1.124`、`2.1.126`、`2.1.128 - 2.1.129`、`2.1.131 - 2.1.133`、`2.1.136 - 2.1.146`、`2.1.148` 实测 1320-1358 处；固定显示面审计均为 11/11 PASS | CLI Patch（扫描真实双引号字符串 token 后逐条替换）+ 显示面审计 |
 | 自动重 patch | - | 版本检测，更新后首次会话自动修复 |
+| 插件描述汉化 | 24 个插件预制翻译 + AI 兜底自动积累 | patch-plugins.js + 翻译词典 + pending 回写闭环 |
 | 插件自动更新 | - | SessionStart Hook（只跟随已发布 Release tag） |
 
 ## 技术原理
 
 <details>
-<summary>展开看四层架构</summary>
+<summary>展开看五层架构</summary>
 
-当前 stable 支持窗口内，Claude Code CLI 是一个 13MB 的单文件压缩包（`cli.js`），UI 文字硬编码其中，没有 i18n 基础设施。本项目通过四层机制实现中文化：
+当前 stable 支持窗口内，Claude Code CLI 是一个 13MB 的单文件压缩包（`cli.js`），UI 文字硬编码其中，没有 i18n 基础设施。本项目通过五层机制实现中文化：
 
 ### Layer 1 — 内置设置（稳定，更新后不丢失）
 - `language`: 控制 AI 回复语言
@@ -252,10 +253,43 @@ powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
 - `session-start` hook 检测版本变更与 patch 规则变更，自动重新 patch
 - 有版本校验的备份机制，`uninstall.sh` 可还原
 
+### Layer 5 — 插件描述自动翻译（patch-plugins.js + AI 兜底）
+
+每次会话启动时，`patch-plugins.js` 自动扫描 `~/.claude/plugins/cache/` 下所有已安装插件的 `plugin.json`、`SKILL.md`、`commands/*.md`，将英文 `description` 替换为中文：
+
 ```
-稳定性：Layer 1~3 完全不受 Claude Code 更新影响
-         Layer 4 自动检测并重新 patch
-         插件自动更新只跟随已发布 Release，不跟随 main 未发布 commit
+scan → lookup → translated? ──yes──→ patch file（增量，仅当内容变化时）
+                    │
+                    no
+                    │
+                    ▼
+          写入 pending-translations.json
+                    │
+                    ▼
+     session-start hook 注入到系统提示词
+                    │
+                    ▼
+           AI 翻译并回写到词典文件
+                    │
+                    ▼
+         下次启动 → 词典命中 → 直接 patch（不再 pending）
+```
+
+**翻译词典**（按优先级加载）：
+
+| 词典文件 | 用途 |
+|----------|------|
+| `plugin/plugin-descriptions-zh.json` | 插件描述翻译（key=插件名, value=中文描述） |
+| `plugin/skill-descriptions-zh.json` | Skill/Command 描述翻译（key=skill名, value=中文描述） |
+
+词典加载顺序：先安装目录，再源仓库覆盖。AI 翻译回写到源仓库（`$SOURCE_REPO/plugin/*-zh.json`），确保插件更新/重装时翻译不丢失。
+
+**覆盖率**：当前预制 `plugin-descriptions-zh.json` 覆盖 24 个热门插件。未覆盖的插件名/技能描述进入 AI 兜底流程，由 Claude 在会话中翻译后回写到词典，下次会话自动匹配。词典随插件持续积累增长。
+
+```
+稳定性：Layer 5 完全独立于 Claude Code 版本
+         增量 patch，只改变化过的文件
+         词典与插件解耦，可独立维护
 ```
 
 </details>

@@ -148,6 +148,16 @@ if [ "$RESTORED" = false ]; then
     fi
 fi
 
+# 清理用户级命令
+if [ -d "$PLUGIN_DST/commands" ]; then
+    for cmd_file in "$PLUGIN_DST/commands"/*.md; do
+        [ -f "$cmd_file" ] || continue
+        cmd_name=$(basename "$cmd_file")
+        rm -f "$HOME/.claude/commands/$cmd_name" 2>/dev/null
+    done
+    echo -e "${GREEN}已清理用户级命令${NC}"
+fi
+
 # 移除插件
 if [ -d "$PLUGIN_DST" ]; then
     rm -rf "$PLUGIN_DST"

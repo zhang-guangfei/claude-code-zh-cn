@@ -2,7 +2,7 @@
 // patch-plugins.js — 插件/命令/技能描述中文化 patch
 // 在 session-start hook 中调用，翻译 plugin.json / marketplace.json / SKILL.md / commands/*.md
 // 增量模式：仅当内容与备份不同时才重新 patch
-// AI 兜底：未翻译项写入 pending-translations.json，由 Claude 在会话中自动翻译
+// AI 兜底：未翻译项写入 .pending-translations.json，由 Claude 在会话中自动翻译
 
 const fs = require("fs");
 const path = require("path");
@@ -12,17 +12,43 @@ const HOME = require("os").homedir();
 
 const pluginTranslationsFile = path.join(PLUGIN_ROOT, "plugin-descriptions-zh.json");
 const skillTranslationsFile = path.join(PLUGIN_ROOT, "skill-descriptions-zh.json");
-const pendingFile = path.join(PLUGIN_ROOT, "pending-translations.json");
+const pendingFile = path.join(PLUGIN_ROOT, ".pending-translations.json");
+
+// 源仓库路径（AI 翻译回写目标），翻译优先从源仓库加载
+const sourceRepoFile = path.join(PLUGIN_ROOT, ".source-repo");
+let SOURCE_REPO = "";
+try {
+    if (fs.existsSync(sourceRepoFile)) {
+        SOURCE_REPO = fs.readFileSync(sourceRepoFile, "utf8").trim();
+    }
+} catch (e) {}
 
 let translations = {};
 let skillTranslations = {};
 
-if (fs.existsSync(pluginTranslationsFile)) {
-    translations = JSON.parse(fs.readFileSync(pluginTranslationsFile, "utf8"));
+// 加载顺序：先安装目录，再源仓库覆盖（源仓库优先，包含 AI 翻译回写）
+function loadJsonMerge(file) {
+    let obj = {};
+    // 安装目录（发布时的预制翻译）
+    const installed = path.join(PLUGIN_ROOT, file);
+    if (fs.existsSync(installed)) {
+        try { obj = JSON.parse(fs.readFileSync(installed, "utf8")); } catch (e) {}
+    }
+    // 源仓库覆盖（AI 翻译回写 + 人工维护）
+    if (SOURCE_REPO && SOURCE_REPO !== PLUGIN_ROOT) {
+        const source = path.join(SOURCE_REPO, "plugin", file);
+        if (fs.existsSync(source)) {
+            try {
+                const sourceObj = JSON.parse(fs.readFileSync(source, "utf8"));
+                Object.assign(obj, sourceObj);
+            } catch (e) {}
+        }
+    }
+    return obj;
 }
-if (fs.existsSync(skillTranslationsFile)) {
-    skillTranslations = JSON.parse(fs.readFileSync(skillTranslationsFile, "utf8"));
-}
+
+translations = loadJsonMerge("plugin-descriptions-zh.json");
+skillTranslations = loadJsonMerge("skill-descriptions-zh.json");
 
 let patchCount = 0;
 let pendingMap = {}; // filePath → englishDescription — 待 Claude 翻译
@@ -65,6 +91,24 @@ function findMarketplaceJsons() {
             if (!e.isDirectory()) continue;
             const mp = path.join(dir, e.name, ".claude-plugin", "marketplace.json");
             if (fs.existsSync(mp)) results.push(mp);
+        }
+    } catch (e) {}
+    return results;
+}
+
+function findMarketplacePluginJsons() {
+    const results = [];
+    const dir = path.join(HOME, ".claude/plugins/marketplaces");
+    try {
+        for (const mp of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (!mp.isDirectory()) continue;
+            const pluginsDir = path.join(dir, mp.name, "plugins");
+            if (!fs.existsSync(pluginsDir)) continue;
+            for (const plugin of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
+                if (!plugin.isDirectory()) continue;
+                const pj = path.join(pluginsDir, plugin.name, ".claude-plugin", "plugin.json");
+                if (fs.existsSync(pj)) results.push(pj);
+            }
         }
     } catch (e) {}
     return results;
@@ -209,11 +253,17 @@ function patchPluginJson(filePath) {
     try {
         original = fs.readFileSync(filePath, "utf8");
         data = JSON.parse(original);
-    } catch (e) { return false; }
+    } catch (e) { return { patched: false, untranslated: false }; }
 
-    if (!data.name || !data.description) return false;
+    if (!data.name || !data.description) return { patched: false, untranslated: false };
     const zhDesc = translations[data.name];
-    if (!zhDesc || data.description === zhDesc) return false;
+    if (!zhDesc) {
+        if (data.description.length > 3 && data.name) {
+            return { patched: false, untranslated: true, enDesc: data.description, name: data.name };
+        }
+        return { patched: false, untranslated: false };
+    }
+    if (data.description === zhDesc) return { patched: false, untranslated: false };
 
     const bakPath = filePath + ".zh-cn-bak";
     if (fs.existsSync(bakPath)) {
@@ -230,14 +280,14 @@ function patchPluginJson(filePath) {
 
     data.description = zhDesc;
     const newContent = JSON.stringify(data, null, 2) + "\n";
-    if (newContent === original) return false;
+    if (newContent === original) return { patched: false, untranslated: false };
 
     try {
         const tmpPath = filePath + ".zh-cn-tmp";
         fs.writeFileSync(tmpPath, newContent);
         fs.renameSync(tmpPath, filePath);
-        return true;
-    } catch (e) { return false; }
+        return { patched: true, untranslated: false };
+    } catch (e) { return { patched: false, untranslated: false }; }
 }
 
 function patchMarketplaceJson(filePath) {
@@ -245,20 +295,33 @@ function patchMarketplaceJson(filePath) {
     try {
         original = fs.readFileSync(filePath, "utf8");
         data = JSON.parse(original);
-    } catch (e) { return false; }
+    } catch (e) { return { patched: false, untranslated: [] }; }
 
     let changed = false;
-    if (data.name && translations[data.name] && data.description !== translations[data.name]) {
-        data.description = translations[data.name]; changed = true;
+    const untranslated = [];
+
+    if (data.name && data.description) {
+        const zhDesc = translations[data.name];
+        if (zhDesc && data.description !== zhDesc) {
+            data.description = zhDesc; changed = true;
+        } else if (!zhDesc && data.description.length > 3) {
+            untranslated.push({ name: data.name, en: data.description });
+        }
     }
+
     if (Array.isArray(data.plugins)) {
         for (const p of data.plugins) {
-            if (p.name && translations[p.name] && p.description !== translations[p.name]) {
-                p.description = translations[p.name]; changed = true;
+            if (!p.name || !p.description) continue;
+            const zhDesc = translations[p.name];
+            if (zhDesc && p.description !== zhDesc) {
+                p.description = zhDesc; changed = true;
+            } else if (!zhDesc && p.description.length > 3) {
+                untranslated.push({ name: p.name, en: p.description });
             }
         }
     }
-    if (!changed) return false;
+
+    if (!changed) return { patched: false, untranslated };
 
     const bakPath = filePath + ".zh-cn-bak";
     if (!fs.existsSync(bakPath)) {
@@ -268,8 +331,8 @@ function patchMarketplaceJson(filePath) {
         const tmpPath = filePath + ".zh-cn-tmp";
         fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n");
         fs.renameSync(tmpPath, filePath);
-        return true;
-    } catch (e) { return false; }
+        return { patched: true, untranslated };
+    } catch (e) { return { patched: false, untranslated }; }
 }
 
 // ============================================================================
@@ -281,34 +344,45 @@ function main() {
 
     // 1. Plugin JSON
     for (const fp of findPluginJsons(cacheDir)) {
-        if (patchPluginJson(fp)) patchCount++;
+        const result = patchPluginJson(fp);
+        if (result.patched) patchCount++;
+        if (result.untranslated && result.enDesc) {
+            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp), type: "plugin" };
+        }
     }
 
-    // 2. Marketplace JSON
+    // 2. Marketplace plugin JSONs（marketplaces/*/plugins/*/plugin.json，/plugin UI 数据源）
+    for (const fp of findMarketplacePluginJsons()) {
+        const result = patchPluginJson(fp);
+        if (result.patched) patchCount++;
+        if (result.untranslated && result.enDesc) {
+            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp), type: "plugin" };
+        }
+    }
+
+    // 3. Marketplace JSON（含未安装插件，提前翻译）
     for (const fp of findMarketplaceJsons()) {
-        if (patchMarketplaceJson(fp)) patchCount++;
-    }
-
-    // 3. SKILL.md
-    if (Object.keys(skillTranslations).length > 0) {
-        for (const fp of findFrontmatterFiles(cacheDir, "SKILL.md")) {
-            const result = patchFrontmatterFile(fp, skillTranslations);
-            if (result.patched) patchCount++;
-            if (result.untranslated && result.enDesc) {
-                pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
+        const result = patchMarketplaceJson(fp);
+        if (result.patched) patchCount++;
+        if (result.untranslated && result.untranslated.length > 0) {
+            for (const entry of result.untranslated) {
+                if (entry.name && entry.en && entry.en.length > 3) {
+                    pendingMap[fp + "::" + entry.name] = { en: entry.en, name: entry.name, type: "plugin" };
+                }
             }
         }
     }
 
-    // 4. commands/*.md (uses same skillTranslations pool)
-    for (const fp of findFrontmatterFiles(cacheDir + "/..", "")) {
-        // findFrontmatterFiles walks all files — filter for commands/*.md
-    }
-    // Actually, let's scan command files specifically
+    // 3. SKILL.md
     for (const fp of findFrontmatterFiles(cacheDir, "SKILL.md")) {
-        // Already handled above
+        const result = patchFrontmatterFile(fp, skillTranslations);
+        if (result.patched) patchCount++;
+        if (result.untranslated && result.enDesc) {
+            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp), type: "skill" };
+        }
     }
-    // Scan for command .md files specifically
+
+    // 4. commands/*.md
     function findCommandFiles(dir) {
         const results = [];
         function walk(d, depth) {
@@ -331,7 +405,7 @@ function main() {
         const result = patchFrontmatterFile(fp, skillTranslations);
         if (result.patched) patchCount++;
         if (result.untranslated && result.enDesc) {
-            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
+            pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp), type: "skill" };
         }
     }
 
@@ -342,7 +416,7 @@ function main() {
             const result = patchFrontmatterFile(fp, skillTranslations);
             if (result.patched) patchCount++;
             if (result.untranslated && result.enDesc) {
-                pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp) };
+                pendingMap[fp] = { en: result.enDesc, name: result.name || path.basename(fp), type: "skill" };
             }
         }
     }
@@ -352,13 +426,10 @@ function main() {
     for (const [fp, info] of Object.entries(pendingMap)) {
         const en = typeof info === 'string' ? info : (info.en || info);
         const name = typeof info === 'string' ? path.basename(path.dirname(fp)) : (info.name || path.basename(path.dirname(fp)));
+        const entryType = (typeof info === 'object' && info.type) ? info.type : "skill";
         const key = name + '::' + en.substring(0, 80);
-        // For duplicate keys, keep the one with shorter path (prefer newer version dirs)
-        if (!deduped[key] || fp.length < Object.keys(deduped).find(k => deduped[k] === deduped[key])?.length || false) {
-            // First occurrence wins; subsequent dupes from other version dirs are skipped
-            if (!deduped[key]) {
-                deduped[key] = { fp, info: { en, name } };
-            }
+        if (!deduped[key]) {
+            deduped[key] = { fp, info: { en, name, type: entryType } };
         }
     }
 

@@ -5,6 +5,7 @@
   "author": "taekchef",
   "license": "MIT",
   "hooks": "hooks.json",
+  "commands": "./commands",
   "outputStyles": [
     {
       "name": "chinese",

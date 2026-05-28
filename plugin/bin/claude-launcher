@@ -167,6 +167,11 @@ main() {
         fi
     fi
 
+    # ELF patch: bare ELF binary without tweakcc trailer (e.g. WSL npm global install)
+    if [ "$install_kind" = "unknown" ] && [ -f "$real_claude" ] && [ -f "$PLUGIN_ROOT/elf-patch.py" ]; then
+        python3 "$PLUGIN_ROOT/elf-patch.py" "$real_claude" "$PLUGIN_ROOT/cli-translations.json" 2>/dev/null || true
+    fi
+
     filtered_path="$(launcher_filtered_path)"
     exec env PATH="$filtered_path" ZH_CN_REAL_CLAUDE="$real_claude" "$real_claude" "$@"
 }

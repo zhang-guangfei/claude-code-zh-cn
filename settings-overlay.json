@@ -1,4 +1,8 @@
 {
   "language": "Chinese",
-  "spinnerTipsEnabled": true
+  "spinnerTipsEnabled": true,
+  "statusLine": {
+    "type": "command",
+    "command": "python3 -c \"\nimport sys, json, os, subprocess\nd = json.load(sys.stdin)\nparts = []\n\nctx = d.get('context_window', {}).get('used_percentage')\nif ctx is not None: parts.append(f'CTX: {ctx}%')\n\nws = d.get('workspace', {})\ndir = ws.get('current_dir', '')\nif dir:\n    home = os.environ.get('HOME', '/home')\n    if dir.startswith(home):\n        dir = '~' + dir[len(home):]\n    branch = ws.get('git_worktree', '')\n    if not branch:\n        try:\n            r = subprocess.run(['git', '--no-optional-locks', 'symbolic-ref', '--short', 'HEAD'], capture_output=True, text=True)\n            if r.returncode == 0:\n                branch = r.stdout.strip()\n        except: pass\n    loc = dir\n    if branch: loc = f'{dir} ({branch})'\n    parts.append(loc)\n\nsn = d.get('session_name')\nif sn: parts.append(sn)\n\nprint('  '.join(parts))\n\" 2>/dev/null || echo \"\"\n"
+  }
 }

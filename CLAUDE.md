@@ -34,6 +34,36 @@ Claude Code CLI 中文本地化插件。
 - Hook 等技术术语保留英文（Hook 不是"钩子"，同 API、PR）
 - Windows 兼容：NTFS 上 `fs.renameSync` 先 unlink 再 rename
 
+## 插件描述翻译系统（Layer 5）
+
+`patch-plugins.js` 在每次 session-start 时扫描已安装和市场插件，将英文描述替换为中文。
+
+### 扫描覆盖
+
+| 数据源 | 路径 | 作用 |
+|--------|------|------|
+| 已安装 plugin.json | `cache/*/.claude-plugin/plugin.json` | 已安装插件描述 |
+| 市场 plugin.json | `marketplaces/*/plugins/*/.claude-plugin/plugin.json` | **`/plugin` UI 数据源** |
+| 市场 marketplace.json | `marketplaces/*/.claude-plugin/marketplace.json` | 市场列表描述 |
+| 已安装 Skill | `cache/*/SKILL.md` | Skill 描述 |
+| 命令 | `cache/*/commands/*.md` | 命令 description |
+| 本地 Skill | `~/.claude/skills/*/SKILL.md` | 用户自定义 Skill |
+
+### 翻译词典
+
+- `plugin/plugin-descriptions-zh.json` — 插件名 → 中文描述
+- `plugin/skill-descriptions-zh.json` — Skill/Command 名 → 中文描述
+
+加载优先级：源仓库覆盖安装目录（`loadJsonMerge`），AI 翻译回写到源仓库，`install.sh` 的 `sync_plugin_payload` 清空 `! -name '.*'` 的非隐藏文件，所以 `.pending-translations.json` 必须以 `.` 开头才能存活。
+
+### 待翻译回写闭环
+
+词典无匹配 → 写入 `.pending-translations.json`（带 `type` 字段） → session-start hook 注入提示词 → AI 翻译回写词典 → 删除 pending 条目 → 下次启动直接 patch
+
+### `/zh` 命令
+
+用户级命令 `~/.claude/commands/zh.md`，三阶段流程：扫描 → 翻译回写 → 重新 patch。`install.sh` 自动部署，`uninstall.sh` 自动清理。
+
 ## 版本发布流程
 
 每完成一批有意义的改动后，按以下步骤发布新版本：

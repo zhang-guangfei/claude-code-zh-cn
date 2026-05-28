@@ -508,6 +508,8 @@ elif [ -f "$CLI_FILE" ]; then
     fi
 fi
 
+# ELF patch 已移至 claude-launcher（pre-launch 阶段执行，避免文件锁定冲突）
+
 repair_settings_from_cache
 
 # 读取用户输入
@@ -516,25 +518,37 @@ node "$PLUGIN_ROOT/patch-plugins.js" >/dev/null 2>&1 || true
 
 # AI 兜底：读取待翻译项
 PENDING_TRANSLATIONS=""
-PENDING_FILE="$PLUGIN_ROOT/pending-translations.json"
+PENDING_FILE="$PLUGIN_ROOT/.pending-translations.json"
+DICT_PLUGIN="$PLUGIN_ROOT/plugin-descriptions-zh.json"
+DICT_SKILL="$PLUGIN_ROOT/skill-descriptions-zh.json"
+# 源仓库优先：AI 翻译应回写到源仓库，确保更新/重装不丢失
+if [ -n "${SOURCE_REPO:-}" ] && [ -d "${SOURCE_REPO:-}" ]; then
+    DICT_PLUGIN="$SOURCE_REPO/plugin/plugin-descriptions-zh.json"
+    DICT_SKILL="$SOURCE_REPO/plugin/skill-descriptions-zh.json"
+fi
 if [ -f "$PENDING_FILE" ] && [ -s "$PENDING_FILE" ]; then
-    PENDING_TRANSLATIONS=$(node -e "
-const fs = require("fs");
-const data = JSON.parse(fs.readFileSync("$PENDING_FILE", "utf8"));
+    PENDING_TRANSLATIONS=$(ZH_CN_DICT_PLUGIN="$DICT_PLUGIN" ZH_CN_DICT_SKILL="$DICT_SKILL" ZH_CN_PENDING_FILE="$PENDING_FILE" node -e "
+const fs = require('fs');
+const data = JSON.parse(fs.readFileSync(process.env.ZH_CN_PENDING_FILE, 'utf8'));
 const items = Object.entries(data);
 if (items.length === 0) process.exit(0);
-let msg = "\\n\\n## AI 翻译兜底：待汉化的 Skill/Command 描述\\n\\n";
-msg += "以下描述尚未翻译，请在本次会话中翻译并更新：\\n\\n";
+let msg = '\\n\\n## AI 翻译兜底：待汉化的 Plugin/Skill/Command 描述\\n\\n';
+msg += '以下描述尚未翻译，请在本次会话中翻译并回写到词典文件，确保下次启动不再出现：\\n\\n';
 let cnt = 0;
 for (const [fp, info] of items) {
     if (cnt >= 12) break;
-    const en = typeof info === "string" ? info : (info.en || info);
-    const nm = info.name || "";
-    msg += "- \`" + fp + "\` [" + nm + "]\\n  " + en.substring(0, 180) + "\\n\\n";
+    const en = typeof info === 'string' ? info : (info.en || info);
+    const nm = info.name || '';
+    const type = (typeof info === 'object' && info.type) ? info.type : 'skill';
+    const dictLabel = type === 'plugin' ? 'plugin-descriptions-zh.json' : 'skill-descriptions-zh.json';
+    msg += '- [' + dictLabel + '] `' + nm + '`\\n  ' + en.substring(0, 180) + '\\n\\n';
     cnt++;
 }
-if (items.length > 12) msg += "...等共 " + items.length + " 项。\\n";
-msg += "\\n翻译后删除 $PENDING_FILE 中对应条目。";
+if (items.length > 12) msg += '...等共 ' + items.length + ' 项。\\n';
+msg += '\\n**翻译回写步骤：**\\n';
+msg += '1. 将翻译添加到 `' + process.env.ZH_CN_DICT_SKILL + '`（skill/command）或 `' + process.env.ZH_CN_DICT_PLUGIN + '`（plugin），格式：`\"name\": \"中文描述\"`\\n';
+msg += '2. 翻译完成后删除 `' + process.env.ZH_CN_PENDING_FILE + '` 中对应条目\\n';
+msg += '3. 下次启动时，patch-plugins.js 加载合并后的词典，自动匹配并直接 patch，不再进入 pending\\n';
 process.stdout.write(msg);
 " 2>/dev/null || true)
 fi

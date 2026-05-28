@@ -73,6 +73,7 @@ print_completion() {
     echo -e "  ${GREEN}✓${NC} 会话启动 Hook → 中文上下文注入"
     echo -e "  ${GREEN}✓${NC} 通知 Hook → 中文翻译"
     echo -e "  ${GREEN}✓${NC} 输出风格 → Chinese"
+    echo -e "  ${GREEN}✓${NC} 状态栏 → 上下文占比 + 工作目录 + 会话名"
     echo -e "  ${GREEN}✓${NC} 自动重 patch → Claude Code 更新后首次会话自动修复"
     if [ "$LAUNCHER_STATUS_OK" = true ]; then
         echo -e "  ${GREEN}✓${NC} npm 启动前自修复 → ${LAUNCHER_STATUS_SUMMARY}"
@@ -373,6 +374,12 @@ sync_plugin_payload() {
     chmod +x "$PLUGIN_DST/hooks/session-start" "$PLUGIN_DST/hooks/notification" 2>/dev/null || true
     chmod +x "$PLUGIN_DST/bin/claude-launcher" 2>/dev/null || true
 
+    # 部署用户级命令（/zh 等）
+    if [ -d "$PLUGIN_DST/commands" ]; then
+        mkdir -p "$HOME/.claude/commands"
+        cp "$PLUGIN_DST/commands/"*.md "$HOME/.claude/commands/" 2>/dev/null || true
+    fi
+
     if [ "$SKIP_BANNER" != "1" ]; then
         echo -e "${GREEN}已安装插件 → ${PLUGIN_DST}${NC}"
     fi
@@ -502,17 +509,45 @@ try {
   process.exit(0);
 }
 
+// npm cli.js check
 const candidates = [
   path.resolve(path.dirname(realPath), "../lib/node_modules/@anthropic-ai/claude-code/cli.js"),
   path.resolve(path.dirname(realPath), "node_modules/@anthropic-ai/claude-code/cli.js"),
 ];
-
 for (const cliFile of candidates) {
   if (fs.existsSync(cliFile)) {
     process.stdout.write(`npm:${cliFile}`);
     process.exit(0);
   }
 }
+
+// npm native binary check (ELF/PE/MachO from npm global install)
+const binCandidates = [
+  path.resolve(path.dirname(realPath), "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+  path.resolve(path.dirname(realPath), "node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+];
+for (const binFile of binCandidates) {
+  if (fs.existsSync(binFile)) {
+    process.stdout.write(`native-bun:${binFile}`);
+    process.exit(0);
+  }
+}
+
+// global npm root fallback
+try {
+  const { execSync } = require("child_process");
+  const globalRoot = execSync("npm root -g", { encoding: "utf8" }).trim();
+  const globalCli = path.join(globalRoot, "@anthropic-ai/claude-code/cli.js");
+  if (fs.existsSync(globalCli)) {
+    process.stdout.write(`npm:${globalCli}`);
+    process.exit(0);
+  }
+  const globalBin = path.join(globalRoot, "@anthropic-ai/claude-code/bin/claude.exe");
+  if (fs.existsSync(globalBin)) {
+    process.stdout.write(`native-bun:${globalBin}`);
+    process.exit(0);
+  }
+} catch {}
 NODE
 }
 
@@ -524,11 +559,11 @@ install_launcher() {
     install_info="$(detect_launcher_installation)"
     install_kind="${install_info%%:*}"
 
-    if [ "$install_kind" != "npm" ]; then
+    if [ "$install_kind" != "npm" ] && [ "$install_kind" != "native-bun" ]; then
         remove_launcher_artifacts
-        LAUNCHER_STATUS_SUMMARY="已跳过（当前 claude 命令不是 npm cli.js）"
+        LAUNCHER_STATUS_SUMMARY="已跳过（未检测到 claude 命令）"
         if [ "$SKIP_BANNER" != "1" ]; then
-            echo -e "${YELLOW}当前安装方式不需要 npm 启动前自修复，已跳过 launcher PATH 注入${NC}"
+            echo -e "${YELLOW}未检测到 claude 命令，已跳过 launcher PATH 注入${NC}"
         fi
         return
     fi
@@ -551,7 +586,7 @@ install_launcher() {
     if [ "$SKIP_BANNER" != "1" ]; then
         echo -e "${GREEN}已安装 launcher → ${LAUNCHER_FILE}${NC}"
     fi
-    LAUNCHER_STATUS_SUMMARY="npm 更新后首次启动会先 patch"
+    LAUNCHER_STATUS_SUMMARY="启动前自动 patch CLI 硬编码文字"
     LAUNCHER_STATUS_OK=true
 }
 
